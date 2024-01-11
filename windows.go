@@ -1,19 +1,28 @@
 package main
 
 import (
-	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 	"unicode/utf16"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
+	"github.com/inancgumus/screen"
 	"github.com/moutend/go-wca/pkg/wca"
 	"golang.org/x/sys/windows"
 )
 
-type AudioSessionInfo struct {
-	ProcessName    string
-	SessionControl *wca.IAudioSessionControl
+var (
+	kernel32                 = syscall.NewLazyDLL("kernel32.dll")
+	procGetConsoleCursorInfo = kernel32.NewProc("GetConsoleCursorInfo")
+	procSetConsoleCursorInfo = kernel32.NewProc("SetConsoleCursorInfo")
+)
+
+type CONSOLE_CURSOR_INFO struct {
+	Size    uint32
+	Visible int32
 }
 
 func debugAudioSessions() (err error) {
@@ -47,96 +56,92 @@ func debugAudioSessions() (err error) {
 	}
 	defer sessionEnumerator.Release()
 
-	var sessionCount int
-	if err = sessionEnumerator.GetCount(&sessionCount); err != nil {
+	var handle syscall.Handle
+	handle, err = syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
+	if err != nil {
 		return
 	}
 
-	var sessions []AudioSessionInfo
-
-	for i := 0; i < sessionCount; i++ {
-		var audioSessionControl *wca.IAudioSessionControl
-		if err := sessionEnumerator.GetSession(i, &audioSessionControl); err != nil {
-			continue
-		}
-		defer audioSessionControl.Release()
-
-		var dispatch *ole.IDispatch
-		dispatch, err = audioSessionControl.QueryInterface(wca.IID_IAudioSessionControl2)
-		if err != nil {
-			continue
-		}
-
-		audioSessionControl2 := (*wca.IAudioSessionControl2)(unsafe.Pointer(dispatch))
-		defer audioSessionControl2.Release()
-
-		var processId uint32
-		if err := audioSessionControl2.GetProcessId(&processId); err != nil {
-			continue
-		}
-
-		processName, err := getProcessName(processId)
-		if err != nil {
-			continue
-		}
-
-		sessions = append(sessions, AudioSessionInfo{
-			ProcessName:    processName,
-			SessionControl: audioSessionControl,
-		})
-	}
-
-	if len(sessions) == 0 {
-		err = fmt.Errorf("no audio sessions found")
-
+	var cci CONSOLE_CURSOR_INFO
+	if err = getConsoleCursorInfo(uintptr(handle), &cci); err != nil {
 		return
 	}
 
-	for index, session := range sessions {
-		log.InfoF("[%d] %s\n", index, session.ProcessName)
-	}
-
-	var index int
-
-	log.InfoF("> ")
-	fmt.Scanf("%d", &index)
-
-	if index < 0 || len(sessions) <= index {
-		err = fmt.Errorf("invalid session")
-
+	cci.Visible = 0
+	if err = setConsoleCursorInfo(uintptr(handle), &cci); err != nil {
 		return
 	}
 
-	session := sessions[index]
+	// wait for ctrl+c signal then restore the cursor
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
-	log.InfoF("Monitoring %s\n", session.ProcessName)
+		<-sig
 
-	var (
-		previousState uint32
-		state         uint32
-	)
+		cci.Visible = 1
+		_ = setConsoleCursorInfo(uintptr(handle), &cci)
+
+		os.Exit(0)
+	}()
 
 	for {
-		if err = session.SessionControl.GetState(&state); err != nil {
+		screen.Clear()
+		screen.MoveTopLeft()
+
+		var sessionCount int
+		if err = sessionEnumerator.GetCount(&sessionCount); err != nil {
 			return
 		}
 
-		if state == wca.AudioSessionStateExpired {
-			log.Warning("Audio session has expired")
+		log.CPrint("- - -", 243, 0)
+		log.CPrint(" Audio Sessions ", 255, 0)
+		log.CPrint("- - -\n", 243, 0)
 
-			break
+		for i := 0; i < sessionCount; i++ {
+			var audioSessionControl *wca.IAudioSessionControl
+			if err := sessionEnumerator.GetSession(i, &audioSessionControl); err != nil {
+				continue
+			}
+			defer audioSessionControl.Release()
+
+			var dispatch *ole.IDispatch
+			dispatch, err = audioSessionControl.QueryInterface(wca.IID_IAudioSessionControl2)
+			if err != nil {
+				continue
+			}
+
+			audioSessionControl2 := (*wca.IAudioSessionControl2)(unsafe.Pointer(dispatch))
+			defer audioSessionControl2.Release()
+
+			var processId uint32
+			if err := audioSessionControl2.GetProcessId(&processId); err != nil {
+				continue
+			}
+
+			processName, err := getProcessName(processId)
+			if err != nil {
+				continue
+			}
+
+			var state uint32
+			if err = audioSessionControl.GetState(&state); err != nil {
+				continue
+			}
+
+			if state == wca.AudioSessionStateActive {
+				log.CPrint(" ⬤ ", 46, 0)
+			} else if state == wca.AudioSessionStateInactive {
+				log.CPrint(" ⬤ ", 196, 0)
+			} else {
+				log.CPrint(" ⬤ ", 102, 0)
+			}
+
+			log.CPrint(processName+"\n", 248, 0)
 		}
 
-		if previousState != state {
-			log.NoteF("%s -> %s\n", stateToString(previousState), stateToString(state))
-		}
-
-		previousState = state
-
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
-
-	return
 }
 
 func getProcessName(pid uint32) (string, error) {
@@ -160,15 +165,26 @@ func getProcessName(pid uint32) (string, error) {
 	return string(utf16.Decode(processName[:i])), nil
 }
 
-func stateToString(state uint32) string {
-	switch state {
-	case wca.AudioSessionStateInactive:
-		return "Inactive"
-	case wca.AudioSessionStateActive:
-		return "Active"
-	case wca.AudioSessionStateExpired:
-		return "Expired"
-	default:
-		return "Unknown"
+func getConsoleCursorInfo(hConsoleOutput uintptr, cci *CONSOLE_CURSOR_INFO) error {
+	ret, _, err := procGetConsoleCursorInfo.Call(
+		hConsoleOutput,
+		uintptr(unsafe.Pointer(cci)),
+	)
+	if ret == 0 {
+		return err
 	}
+
+	return nil
+}
+
+func setConsoleCursorInfo(hConsoleOutput uintptr, cci *CONSOLE_CURSOR_INFO) error {
+	ret, _, err := procSetConsoleCursorInfo.Call(
+		hConsoleOutput,
+		uintptr(unsafe.Pointer(cci)),
+	)
+	if ret == 0 {
+		return err
+	}
+
+	return nil
 }
